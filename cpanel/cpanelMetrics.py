@@ -1,101 +1,111 @@
-#!/usr/bin/python
+#!/usr/bin/env python2.6
 
-from platform import node
+from socket import socket,error
+from time import time,sleep
 from subprocess import Popen,PIPE
-from json import loads,dumps
-from time import time
-from os import listdir
+from platform import node
+import json
+import os
 
-#cfg
-CPCMD='/usr/local/cpanel/cpanel -V'
-#UAPI
-UAPICMD='uapi --output=json --user={0} StatsBar get_stats display={1} warnings=0 warninglevel=high warnout=0 infinityimg=%2Fhome%2Fexample%2Finfinity.pnginfinitylang="infinity" rowcounter=even'
-UAPIVALUES=['addondomains emailaccounts ftpaccounts sqldatabases diskusage mysqldiskusage bandwidthusage']
-#API2
-LVEUSERVALUES=['aCPU aVMem mVMem']
-LVEINFOCMD='lveinfo --period 1h --show-columns {0} -d -l 0 -j'
+class CpanelMetrics:
 
-def getLveList():
-  '''
-  Returns a list of existing lves
-  '''
-  return listdir('/var/cpanel/users')
+  CARBONRETRY = 4
+  CARBON_HOST = '<host>'
+  CARBON_PORT = <port>
+  GRAPHITEPREFIX = 'path'
 
-def getUapi(lveName,uapiCmd,uapi):
-  '''
-  Returns a dict of UAPIVALUES read via UAPI for a given lve
-  '''
-  cmd=uapiCmd.format(lveName,'|'.join(uapi[0].split()))
-  res=Popen(cmd.split(),stdout=PIPE,stderr=PIPE)
-  (out, err)=res.communicate()
-  if (res.returncode == 0):
-    dic=dict([[data['id'],data['_count']] for data in loads(out)['result']['data'] for val in UAPIVALUES[0].split() if data['name']==val])
-    #cast counters from unicode to int or float
-    for key in dic.keys():
-      try:
-        dic[key]=int(dic[key])
-      except ValueError:
-        dic[key]=float(dic[key])
-    return dic
-  else:
-    return {}
+  def __init__(self):
+    '''
+    self.uapiCmd - command to get values trough UAPI
+    self.uapiValues - cpanel properties to get
+    '''
+    self.uapiValues = 'addondomains emailaccounts ftpaccounts sqldatabases diskusage mysqldiskusage bandwidthusage'
+    self.uapiCmd = 'uapi --output=json --user={0} StatsBar get_stats display={1} warnings=0 warninglevel=high warnout=0 infinityimg=%2Fhome%2Fexample%2Finfinity.pnginfinitylang="infinity" rowcounter=even'
+    self.cpanelVersionCmd = '/usr/local/cpanel/cpanel -V'
+    self.minCpanelVersion = 56
+    self.cpanelUserDir = '/var/cpanel/users'
+    self.cpanelList = None
+    self.metrics = {}
+    self.msg = ''
 
-def getLveValues(LVEINFOCMD,LVEUSERVALUES):
-  '''
-  Returns a dict of values read via lve tools for all accounts
-  '''
-  cmd=LVEINFOCMD.format('id '+LVEUSERVALUES[0])
-  lve=Popen(cmd.split(),stderr=PIPE,stdout=PIPE)
-  (out, err)=lve.communicate()
-  dic={}
-  if (lve.returncode == 0):
-    #turn list of dicts into dict with lists as values
-    for elem in loads(out)['data']:
-      id=elem.pop('ID')
-      res=[]
-      [res.append({key:elem[key]}) for key in elem.keys()]
-      dic.update({id:res})
-  return dic
+  def getCpanelVersion(self):
 
-def cpanelReleaseOk(cpCmd):
-  '''
-  Checks if cPanel version is sufficient;
-  Returns: 1 -> yes, 0 -> no
-  '''
-  #Read cPanel release
-  cmd=Popen(cpCmd.split(),stderr=PIPE,stdout=PIPE)
-  (out,err)=cmd.communicate()
-  if (cmd.returncode == 0):
-    if (int(out.split('.')[0])>=56):
+    ver = Popen(self.cpanelVersionCmd.split(),stdout=PIPE,stderr=PIPE)
+    (out, err) = ver.communicate()
+    if (ver.returncode == 0) and (int(out.split('.')[0]) >= self.minCpanelVersion):
       return 1
     else:
       return 0
 
-if cpanelReleaseOk(CPCMD):
+  def enumerateHostCpanels(self):
+    '''
+    Returns a set of cpanel names on current host
+    '''
 
-  metrics={}
-  #Get list of LVEs
-  lveList=getLveList()
+    if self.cpanelList is None:
+      self.cpanelList = set(os.listdir(self.cpanelUserDir))
 
-  #Get data available via API
-  for name in lveList:
-    metrics.update({name:getUapi(name,UAPICMD,UAPIVALUES)})
+  def getUapiValues(self):
+    '''
+    Returns a dict of { '<cpanelName>': { '<prop>': <val>, ['<prop>': <val>,], ...}, ... }
+    '''
 
-  #Get data available via lve tools directly
-  lveMetrics=getLveValues(LVEINFOCMD,LVEUSERVALUES)
+    if self.metrics == {}:
 
-  #Glue API and lve tools data into single hash
-  for key in metrics.keys():
-    try:
-      for elemCnt in range(len(lveMetrics[key])):
-        for elem in lveMetrics[key]:
-          if (len(elem) !=0):
-            pop=elem.popitem()
-            metrics[key].update({pop[0]:pop[1]})
-    except KeyError:
-      for elem in LVEUSERVALUES[0].split():
-        metrics[key].update({elem:0})
+      self.enumerateHostCpanels()
 
-  print(dumps(metrics,indent=4))
-else:
-  print 'Error: Insufficient cPanel release'
+      for cpanel in self.cpanelList:
+        cmd = self.uapiCmd.format(cpanel,'|'.join(self.uapiValues.split()))
+        uapi = Popen(cmd.split(),stdout=PIPE,stderr=PIPE)
+        (out, err) = uapi.communicate()
+        try:
+          if (uapi.returncode == 0):
+            dic=dict([[res['id'],res['_count']] for res in json.loads(out)['result']['data'] for val in self.uapiValues.split() if res['name']==val])
+            self.metrics.update({cpanel:dic})
+            for key in self.metrics[cpanel].keys():
+              try:
+                self.metrics[cpanel][key]=int(self.metrics[cpanel][key])
+              except ValueError:
+                self.metrics[cpanel][key]=float(self.metrics[cpanel][key])
+        except:
+          continue
+
+  def formatGraphiteMsg(self):
+    '''
+    Returns a string of graphite's plaintext protocol msg
+    '''
+
+    if self.metrics == {}:
+      self.getUapiValues()
+
+    tstamp=int(time())
+    self.msg = ''
+
+    for cpanel in self.metrics.keys():
+      for key in self.metrics[cpanel].keys():
+        self.msg+='{0} {1} {2}\n'.format(self.GRAPHITEPREFIX+'.'+cpanel+'.'+key,self.metrics[cpanel][key],tstamp)
+
+  def feedGraphite(self):
+    '''
+    Send msg to graphite by plaintext protocol
+    '''
+
+    if self.msg == '':
+      self.formatGraphiteMsg()
+
+    for retr in range(0,self.CARBONRETRY):
+      try:
+        s=socket()
+        s.connect((self.CARBON_HOST,self.CARBON_PORT))
+        s.sendall(self.msg)
+        s.close()
+        break
+      except error as e:
+        if (retr != (self.CARBONRETRY-1)):
+          sleep(1)
+        else:
+          raise(e)
+
+if __name__ == '__main__':
+  metrics=CpanelMetrics()
+  metrics.feedGraphite()
